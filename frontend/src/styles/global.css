@@ -70,3 +70,16 @@ body { margin: 0; background: #f6f8fb; color: #1f2937; }
 .analysis-chart { display: flex; align-items: flex-end; gap: 8px; height: 160px; padding: 12px 0; }
 .analysis-bar { flex: 1; border-radius: 4px 4px 0 0; background: var(--brand); min-width: 24px; position: relative; transition: height 0.4s; }
 .analysis-bar span { position: absolute; bottom: -20px; left: 50%; transform: translateX(-50%); font-size: 10px; color: var(--muted); white-space: nowrap; }
+/* 抽样检验回执与投递核对面板 */
+.panel { margin-top: 16px; background: #fff; border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+.panel-head h3 { margin: 0 0 4px; }
+.panel-desc { color: var(--muted); font-size: 12px; margin: 0 0 10px; }
+.panel-form { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; margin-bottom: 10px; }
+.panel-field span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.panel-field input { border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+.panel-message { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 6px; padding: 8px 10px; font-size: 13px; }
+.panel-message[data-decision='待核'] { background: #fffbeb; border-color: #fde68a; }
+.panel-subhead { margin: 14px 0 8px; font-size: 14px; }
+.receipt-chain { list-style: none; margin: 0; padding: 0; }
+.receipt-chain li { border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; font-size: 13px; }
+.chain-event { display: block; color: var(--muted); font-size: 12px; margin-top: 4px; }

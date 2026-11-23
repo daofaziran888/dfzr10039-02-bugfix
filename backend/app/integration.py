@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import random
 import re
 from datetime import datetime, timezone
@@ -21,7 +22,7 @@ from app.models import (
     AntiBlockStrategy, AntiType, ArchiveFormat, ArchivePolicy, CleanedContent,
     CleanRule, CostRecord, CrawlJobSpec, CrawlLimitRule, DeliveryFormat,
     DeliveryTask, DiffRecord, ExtractRule, IncrCursor, ParseLogEntry,
-    ProxyNode, QualitySample, RawExtractedContent, SampleMethod,
+    ProxyNode, QualitySample, RawExtractedContent, SampleMethod, SampleReceipt,
     SchedulePlan, SiteConfig, SiteType, StorageBatch, UrlFingerprint,
 )
 from app.store import store
@@ -305,7 +306,8 @@ def deliver_and_sample(batch: StorageBatch) -> tuple[DeliveryTask | None, Qualit
         )
         _persist_delivery(dt)
 
-    # 质量抽样
+    # 质量抽样：先完成抽样计算，再统一落库。
+    # 已算出有效条数但台账/回执未落库是历史缺陷，这里保证台账与回执同源一致。
     sample_rows = [r for r in store.rows("quality_sample")
                    if r.get("目标批次") == batch.batch_id]
     if sample_rows:
@@ -322,18 +324,452 @@ def deliver_and_sample(batch: StorageBatch) -> tuple[DeliveryTask | None, Qualit
             last_sampled=datetime.now(timezone.utc).isoformat(),
             status="已通过" if batch.status == "校验通过" else "偏差告警",
         )
-        _persist_sample(qs)
 
     # 从批次中随机抽取 sample_size 条记录进行校验
+    sampled_records: list[CleanedContent] = []
     if batch.records and qs.sample_size > 0:
-        sampled = random.sample(batch.records, min(qs.sample_size, len(batch.records)))
-        valid_count = sum(1 for s in sampled if s.is_valid())
-        actual_ratio = valid_count / len(sampled) if sampled else 0
-        qs.check_result = f"抽样{len(sampled)}条，有效{valid_count}条"
-        if actual_ratio < (1 - qs.deviation_threshold):
-            qs.status = "偏差告警"
+        sampled_records = random.sample(batch.records, min(qs.sample_size, len(batch.records)))
+        valid_count = sum(1 for s in sampled_records if s.is_valid())
+        actual_ratio = valid_count / len(sampled_records) if sampled_records else 0
+        qs.check_result = f"抽样{len(sampled_records)}条，有效{valid_count}条"
+        qs.status = "偏差告警" if actual_ratio < (1 - qs.deviation_threshold) else "已通过"
+
+    # 抽样结果落库：已有计划回填台账行，否则计算后再新增，避免台账空白
+    if sample_rows:
+        _update_sample_row(sample_rows[0], qs)
+    else:
+        _persist_sample(qs)
+
+    # 抽样检验回执落库：流水线自检结论直接确认，投递可沿用同一份回执
+    _ensure_pipeline_receipt(qs, batch, sampled_records)
 
     return dt, qs
+
+
+# ---------------------------------------------------------------------------
+# 抽样检验回执：质量抽样 → 数据投递 的放行依据
+#
+# 规则：
+# - 回执按 (计划, 批次, 批次版本, 检验次数) 锁定，换版本后旧回执不能放行新版本；
+# - 同次检验并发提交只保留一份待核回执（回执冲突合并），并发确认只生效一次；
+# - 待核回执可中断，中断后恢复会生成新次数的回执，各自留痕；
+# - 投递核对同一批次时只沿用当前批次版本的已确认回执，否则保持待核。
+# ---------------------------------------------------------------------------
+
+RECEIPT_PENDING = "待核"
+RECEIPT_CONFIRMED = "已确认"
+RECEIPT_INTERRUPTED = "已中断"
+
+# 本次运行内持久化过的批次对象，供检验时抽取真实记录
+_LIVE_BATCHES: dict[str, StorageBatch] = {}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def _find_receipt(receipt_id: str) -> dict[str, Any] | None:
+    for row in store.receipts():
+        if row.get("receipt_id") == receipt_id:
+            return row
+    return None
+
+
+def _receipts_for(plan_id: str, batch_id: str, batch_version: str) -> list[dict[str, Any]]:
+    return [
+        row for row in store.receipts()
+        if row.get("plan_id") == plan_id
+        and row.get("batch_id") == batch_id
+        and row.get("batch_version") == batch_version
+    ]
+
+
+def _append_receipt(receipt: SampleReceipt) -> dict[str, Any]:
+    row = receipt.to_row()
+    row["id"] = max((int(r.get("id", 0)) for r in store.receipts()), default=0) + 1
+    store.receipts().append(row)
+    return row
+
+
+def _latest_batch_row(batch_id: str) -> dict[str, Any] | None:
+    rows = [r for r in store.rows("batch_store") if str(r.get("批次编号")) == batch_id]
+    return rows[-1] if rows else None
+
+
+def _find_or_create_plan_row(batch_id: str, batch_row: dict[str, Any],
+                             sample_size: int | None = None) -> dict[str, Any]:
+    rows = store.rows("quality_sample")
+    for row in rows:
+        if str(row.get("目标批次")) == batch_id:
+            return row
+    row_count = _parse_int(batch_row.get("数据行数"), 0)
+    size = sample_size or (max(1, int(row_count * 0.1)) if row_count > 0 else 2)
+    plan_id = f"QS-{batch_id}"
+    existing_ids = {str(r.get("计划编号")) for r in rows}
+    base, seq = plan_id, 2
+    while plan_id in existing_ids:
+        plan_id = f"{base}-{seq}"
+        seq += 1
+    row = {
+        "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
+        "计划编号": plan_id,
+        "目标批次": batch_id,
+        "抽样比例": "0.1",
+        "抽样方式": SampleMethod.RANDOM.value,
+        "样本数量": size,
+        "检验结果": "",
+        "偏差阈值": "0.05",
+        "最近采样": "",
+        "status": "待采样",
+        "pending": True,
+        "abnormal": False,
+    }
+    rows.append(row)
+    return row
+
+
+def _compute_samples(batch_id: str, version: str, batch_status: str,
+                     row_count: int, sample_size: int) -> tuple[list[dict[str, Any]], int]:
+    """按批次版本锁定抽样输入，返回样本明细和有效条数。"""
+    pool: list[tuple[str, bool]] = []
+    live = _LIVE_BATCHES.get(batch_id)
+    if live is not None and live.records and live.schema_version == version:
+        pool = [(record.source_url, record.is_valid()) for record in live.records]
+    else:
+        count = row_count if row_count > 0 else sample_size
+        all_valid = batch_status == "校验通过"
+        pool = [(f"{batch_id}#row-{i + 1}", all_valid) for i in range(count)]
+    picked = pool[:max(1, sample_size)] if pool else []
+    samples = [
+        {
+            "seq": index,
+            "ref": ref,
+            "valid": valid,
+            "digest": hashlib.sha256(f"{batch_id}:{version}:{ref}".encode()).hexdigest()[:12],
+        }
+        for index, (ref, valid) in enumerate(picked, start=1)
+    ]
+    valid_count = sum(1 for sample in samples if sample["valid"])
+    return samples, valid_count
+
+
+def _sync_plan_from_receipt(receipt: dict[str, Any]) -> None:
+    """把已确认回执的检验结论同步到质量抽样台账。"""
+    for row in store.rows("quality_sample"):
+        if str(row.get("计划编号")) == receipt.get("plan_id"):
+            row["样本数量"] = receipt["sample_size"]
+            row["检验结果"] = receipt["check_result"]
+            row["最近采样"] = receipt["confirmed_at"] or receipt["created_at"]
+            row["status"] = "已通过" if receipt["conclusion"] == "通过" else "偏差告警"
+            row["pending"] = False
+            row["abnormal"] = receipt["conclusion"] != "通过"
+            return
+
+
+def _ensure_pipeline_receipt(qs: QualitySample, batch: StorageBatch,
+                             sampled_records: list[CleanedContent]) -> dict[str, Any] | None:
+    """流水线自检回执：同批次同版本已有回执则沿用，否则生成并直接确认。"""
+    version = batch.schema_version or "v1"
+    with store.receipt_lock:
+        siblings = _receipts_for(qs.plan_id, batch.batch_id, version)
+        if siblings:
+            return siblings[-1]  # 沿用已有回执（待核/已确认/已中断各自留痕）
+        samples = [
+            {
+                "seq": index,
+                "ref": record.source_url,
+                "valid": record.is_valid(),
+                "digest": hashlib.sha256(
+                    f"{batch.batch_id}:{version}:{record.source_url}".encode()).hexdigest()[:12],
+            }
+            for index, record in enumerate(sampled_records, start=1)
+        ]
+        valid_count = sum(1 for sample in samples if sample["valid"])
+        now = _now_iso()
+        receipt = SampleReceipt(
+            receipt_id=f"RCPT-{qs.plan_id}-{version}-A1",
+            plan_id=qs.plan_id,
+            batch_id=batch.batch_id,
+            batch_version=version,
+            sample_size=qs.sample_size,
+            valid_count=valid_count,
+            check_result=qs.check_result,
+            conclusion="通过" if qs.status == "已通过" else "偏差告警",
+            samples=samples,
+            batch_checksum=batch.checksum[:16],
+            batch_status=batch.status,
+            attempt=1,
+            status=RECEIPT_CONFIRMED,
+            created_at=now,
+            confirmed_at=now,
+            confirmed_by="系统自检",
+            history=[
+                {"time": now, "event": "流水线自检", "actor": "系统"},
+                {"time": now, "event": "确认通过", "actor": "系统自检"},
+            ],
+        )
+        return _append_receipt(receipt)
+
+
+def start_sample_inspection(batch_id: str, sample_size: int | None = None,
+                            operator: str = "") -> tuple[dict[str, Any] | None, str, str]:
+    """发起抽样检验：生成待核回执；并发提交合并到同一份回执，已确认则沿用。"""
+    with store.receipt_lock:
+        batch_row = _latest_batch_row(batch_id)
+        if batch_row is None:
+            return None, f"采集批次 {batch_id} 不存在", "missing"
+        version = str(batch_row.get("Schema版本") or "v1")
+        plan_row = _find_or_create_plan_row(batch_id, batch_row, sample_size)
+        plan_id = str(plan_row["计划编号"])
+        siblings = _receipts_for(plan_id, batch_id, version)
+
+        confirmed = [r for r in siblings if r["status"] == RECEIPT_CONFIRMED]
+        if confirmed:
+            receipt = confirmed[-1]
+            return receipt, f"批次版本 {version} 已有已确认回执 {receipt['receipt_id']}，沿用检验结论", "reused"
+        pending = [r for r in siblings if r["status"] == RECEIPT_PENDING]
+        if pending:
+            receipt = pending[-1]
+            return receipt, f"批次版本 {version} 已存在待核回执 {receipt['receipt_id']}，并发提交已合并", "conflict"
+
+        size = sample_size or _parse_int(plan_row.get("样本数量"), 0) or 2
+        row_count = _parse_int(batch_row.get("数据行数"), 0)
+        batch_status = str(batch_row.get("status", ""))
+        samples, valid_count = _compute_samples(batch_id, version, batch_status, row_count, size)
+        conclusion = "通过" if batch_status == "校验通过" and valid_count == len(samples) else (
+            "偏差告警" if valid_count < len(samples) else "通过")
+        attempt = max((_parse_int(r.get("attempt"), 0) for r in siblings), default=0) + 1
+        now = _now_iso()
+        receipt = SampleReceipt(
+            receipt_id=f"RCPT-{plan_id}-{version}-A{attempt}",
+            plan_id=plan_id,
+            batch_id=batch_id,
+            batch_version=version,
+            sample_size=size,
+            valid_count=valid_count,
+            check_result=f"抽样{len(samples)}条，有效{valid_count}条",
+            conclusion=conclusion,
+            samples=samples,
+            batch_checksum=str(batch_row.get("校验摘要", "")),
+            batch_status=batch_status,
+            attempt=attempt,
+            status=RECEIPT_PENDING,
+            created_at=now,
+            history=[{"time": now, "event": "发起检验", "actor": operator or "系统"}],
+        )
+        row = _append_receipt(receipt)
+        # 抽样结果同步到质量抽样台账，计划进入采样中
+        plan_row["样本数量"] = size
+        plan_row["检验结果"] = row["check_result"]
+        plan_row["最近采样"] = now
+        plan_row["status"] = "采样中"
+        plan_row["pending"] = True
+        return row, f"已生成待核回执 {row['receipt_id']}，等待操作员复核", "created"
+
+
+def confirm_receipt(receipt_id: str, operator: str = "") -> tuple[dict[str, Any] | None, str]:
+    """确认回执：同次检验并发确认只生效一次，并把结论同步到抽样台账。"""
+    with store.receipt_lock:
+        receipt = _find_receipt(receipt_id)
+        if receipt is None:
+            return None, f"回执 {receipt_id} 不存在"
+        if receipt["status"] == RECEIPT_CONFIRMED:
+            return receipt, f"回执 {receipt_id} 已确认，并发确认不重复生效"
+        if receipt["status"] == RECEIPT_INTERRUPTED:
+            return None, f"回执 {receipt_id} 已中断，请通过重试生成新回执"
+        now = _now_iso()
+        receipt["status"] = RECEIPT_CONFIRMED
+        receipt["confirmed_at"] = now
+        receipt["confirmed_by"] = operator or "系统"
+        receipt["history"].append({"time": now, "event": "确认通过", "actor": operator or "系统"})
+        _sync_plan_from_receipt(receipt)
+        return receipt, f"回执 {receipt_id} 已确认，检验结论生效"
+
+
+def interrupt_receipt(receipt_id: str, operator: str = "") -> tuple[dict[str, Any] | None, str]:
+    """中断待核回执：保留中断记录，后续恢复走重试生成新回执。"""
+    with store.receipt_lock:
+        receipt = _find_receipt(receipt_id)
+        if receipt is None:
+            return None, f"回执 {receipt_id} 不存在"
+        if receipt["status"] == RECEIPT_CONFIRMED:
+            return None, f"回执 {receipt_id} 已确认，不可中断"
+        if receipt["status"] == RECEIPT_INTERRUPTED:
+            return receipt, f"回执 {receipt_id} 已处于中断状态"
+        receipt["status"] = RECEIPT_INTERRUPTED
+        receipt["history"].append(
+            {"time": _now_iso(), "event": "检验中断", "actor": operator or "系统"})
+        return receipt, f"回执 {receipt_id} 已中断，可通过重试恢复检验"
+
+
+def retry_receipt(receipt_id: str, operator: str = "") -> tuple[dict[str, Any] | None, str]:
+    """中断后恢复：沿用锁定在原批次版本的抽样输入，生成新次数的回执。"""
+    with store.receipt_lock:
+        old = _find_receipt(receipt_id)
+        if old is None:
+            return None, f"回执 {receipt_id} 不存在"
+        if old["status"] != RECEIPT_INTERRUPTED:
+            return None, f"回执 {receipt_id} 未中断，无需重试"
+        siblings = _receipts_for(old["plan_id"], old["batch_id"], old["batch_version"])
+        attempt = max((_parse_int(r.get("attempt"), 0) for r in siblings), default=0) + 1
+        now = _now_iso()
+        receipt = SampleReceipt(
+            receipt_id=f"RCPT-{old['plan_id']}-{old['batch_version']}-A{attempt}",
+            plan_id=old["plan_id"],
+            batch_id=old["batch_id"],
+            batch_version=old["batch_version"],
+            sample_size=old["sample_size"],
+            valid_count=old["valid_count"],
+            check_result=old["check_result"],
+            conclusion=old["conclusion"],
+            samples=[dict(s) for s in old["samples"]],
+            batch_checksum=old["batch_checksum"],
+            batch_status=old["batch_status"],
+            attempt=attempt,
+            status=RECEIPT_PENDING,
+            created_at=now,
+            resumed_from=old["receipt_id"],
+            history=[{
+                "time": now, "event": f"中断恢复重试（源自 {old['receipt_id']}）",
+                "actor": operator or "系统",
+            }],
+        )
+        row = _append_receipt(receipt)
+        return row, f"已生成第 {attempt} 次检验回执 {row['receipt_id']}，等待复核"
+
+
+def list_receipts(batch_id: str | None = None, batch_version: str | None = None,
+                  status: str | None = None) -> list[dict[str, Any]]:
+    """质检视图回执列表：操作员可复核的抽样检验回执。"""
+    rows = list(store.receipts())
+    if batch_id:
+        rows = [r for r in rows if r.get("batch_id") == batch_id]
+    if batch_version:
+        rows = [r for r in rows if r.get("batch_version") == batch_version]
+    if status:
+        rows = [r for r in rows if r.get("status") == status]
+    return [dict(r) for r in rows]
+
+
+def receipt_detail(receipt_id: str) -> dict[str, Any] | None:
+    """回执明细：样本、对应批次校验结果和同次检验的完整历程。"""
+    receipt = _find_receipt(receipt_id)
+    if receipt is None:
+        return None
+    chain = sorted(
+        _receipts_for(receipt["plan_id"], receipt["batch_id"], receipt["batch_version"]),
+        key=lambda r: _parse_int(r.get("attempt"), 0),
+    )
+    batch_row = _latest_batch_row(receipt["batch_id"])
+    detail = dict(receipt)
+    detail["chain"] = [dict(r) for r in chain]
+    detail["batch"] = dict(batch_row) if batch_row else None
+    return detail
+
+
+def submit_delivery(batch_id: str | None = None,
+                    task_no: str | None = None) -> tuple[dict[str, Any] | None, str, str]:
+    """投递核对：凭当前批次版本的已确认回执决定放行或待核，取数依据写回台账。"""
+    with store.receipt_lock:
+        task_row: dict[str, Any] | None = None
+        if task_no:
+            for row in store.rows("data_delivery"):
+                if str(row.get("任务编号")) == task_no:
+                    task_row = row
+                    break
+            if task_row is None:
+                return None, f"投递任务 {task_no} 不存在", "missing"
+        if batch_id is None and task_row is not None:
+            batch_id = str(task_row.get("数据来源") or "") or None
+        if batch_id is None:
+            return None, "缺少批次编号，无法核对投递", "missing"
+        if task_row is None:
+            for row in store.rows("data_delivery"):
+                if str(row.get("数据来源")) == batch_id:
+                    task_row = row
+                    break
+
+        batch_row = _latest_batch_row(batch_id)
+        if batch_row is None:
+            return None, f"采集批次 {batch_id} 不存在", "missing"
+        version = str(batch_row.get("Schema版本") or "v1")
+
+        if task_row is None:
+            task_row = _create_delivery_row(batch_id, batch_row)
+
+        confirmed = [
+            r for r in store.receipts()
+            if r.get("batch_id") == batch_id
+            and r.get("batch_version") == version
+            and r.get("status") == RECEIPT_CONFIRMED
+        ]
+        now = _now_iso()
+        if confirmed and confirmed[-1]["conclusion"] == "通过":
+            receipt = confirmed[-1]
+            task_row["投递状态"] = "已完成"
+            task_row["status"] = "已完成"
+            task_row["pending"] = False
+            task_row["abnormal"] = False
+            task_row["最近投递"] = now
+            task_row["质检回执"] = receipt["receipt_id"]
+            task_row["批次版本"] = version
+            task_row["取数依据"] = (
+                f"回执 {receipt['receipt_id']} · 批次版本 {version} · "
+                f"{receipt['check_result']}（{receipt['conclusion']}）")
+            task_row["放行结论"] = "放行"
+            return task_row, (
+                f"批次版本 {version} 检验已通过，凭回执 {receipt['receipt_id']} 放行投递"), "放行"
+
+        if confirmed:  # 已确认但结论为偏差告警：沿用结论，保持待核
+            receipt = confirmed[-1]
+            basis = (f"回执 {receipt['receipt_id']} · 批次版本 {version} · "
+                     f"{receipt['check_result']}（{receipt['conclusion']}），待复核")
+            message = f"批次版本 {version} 检验结论为{receipt['conclusion']}，投递保持待核"
+        else:
+            receipt = None
+            basis = f"批次版本 {version} 暂无已确认回执，投递待核"
+            message = f"批次版本 {version} 暂无已确认回执，投递保持待核"
+        task_row["投递状态"] = "待投递"
+        task_row["status"] = "待投递"
+        task_row["pending"] = True
+        task_row["质检回执"] = receipt["receipt_id"] if receipt else ""
+        task_row["批次版本"] = version
+        task_row["取数依据"] = basis
+        task_row["放行结论"] = "待核"
+        return task_row, message, "待核"
+
+
+def _create_delivery_row(batch_id: str, batch_row: dict[str, Any]) -> dict[str, Any]:
+    rows = store.rows("data_delivery")
+    task_no = f"DEL-{batch_id}"
+    existing = {str(r.get("任务编号")) for r in rows}
+    base, seq = task_no, 2
+    while task_no in existing:
+        task_no = f"{base}-{seq}"
+        seq += 1
+    row = {
+        "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
+        "任务编号": task_no,
+        "数据来源": batch_id,
+        "目标系统": f"data_warehouse_{batch_row.get('来源作业', '')}",
+        "投递格式": DeliveryFormat.CSV.value,
+        "投递频率": "manual",
+        "分区策略": "by_date",
+        "最近投递": "",
+        "投递状态": "待投递",
+        "status": "待投递",
+        "pending": True,
+        "abnormal": False,
+    }
+    rows.append(row)
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +1002,7 @@ def _persist_batch(batch: StorageBatch) -> None:
         "pending": False,
         "abnormal": batch.status == "校验失败",
     })
+    _LIVE_BATCHES[batch.batch_id] = batch
 
 
 def _persist_fingerprint(fp: UrlFingerprint) -> None:
@@ -629,6 +1066,20 @@ def _persist_sample(qs: QualitySample) -> None:
         "status": qs.status, "pending": False,
         "abnormal": qs.status == "偏差告警",
     })
+
+
+def _update_sample_row(row: dict[str, Any], qs: QualitySample) -> None:
+    """把抽样计算结果回填到已有的质量抽样台账行，避免台账与实测脱节。"""
+    row["抽样比例"] = str(qs.sample_ratio)
+    row["抽样方式"] = qs.sample_method.value if isinstance(
+        qs.sample_method, SampleMethod) else str(qs.sample_method)
+    row["样本数量"] = qs.sample_size
+    row["检验结果"] = qs.check_result
+    row["偏差阈值"] = str(qs.deviation_threshold)
+    row["最近采样"] = qs.last_sampled
+    row["status"] = qs.status
+    row["pending"] = False
+    row["abnormal"] = qs.status == "偏差告警"
 
 
 def _persist_diff(diff: DiffRecord) -> None:

@@ -408,6 +408,55 @@ class QualitySample:
 
 
 @dataclass
+class SampleReceipt:
+    """抽样检验回执：quality_sample 生成并落库，data_delivery 凭批次版本取数。
+
+    回执与 (计划, 批次, 批次版本, 检验次数) 锁定：同一批次换版本后，
+    旧版本的已确认回执不能用于新版本的投递放行。
+    """
+    receipt_id: str
+    plan_id: str
+    batch_id: str
+    batch_version: str
+    sample_size: int = 0
+    valid_count: int = 0
+    check_result: str = ""
+    conclusion: str = "通过"            # 通过 / 偏差告警
+    samples: list[dict[str, Any]] = field(default_factory=list)
+    batch_checksum: str = ""
+    batch_status: str = ""
+    attempt: int = 1
+    status: str = "待核"                # 待核 / 已确认 / 已中断
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    confirmed_at: str = ""
+    confirmed_by: str = ""
+    resumed_from: str = ""              # 中断后恢复时指向上一条回执
+    history: list[dict[str, str]] = field(default_factory=list)
+
+    def to_row(self) -> dict[str, Any]:
+        return {
+            "receipt_id": self.receipt_id,
+            "plan_id": self.plan_id,
+            "batch_id": self.batch_id,
+            "batch_version": self.batch_version,
+            "sample_size": self.sample_size,
+            "valid_count": self.valid_count,
+            "check_result": self.check_result,
+            "conclusion": self.conclusion,
+            "samples": [dict(s) for s in self.samples],
+            "batch_checksum": self.batch_checksum,
+            "batch_status": self.batch_status,
+            "attempt": self.attempt,
+            "status": self.status,
+            "created_at": self.created_at,
+            "confirmed_at": self.confirmed_at,
+            "confirmed_by": self.confirmed_by,
+            "resumed_from": self.resumed_from,
+            "history": [dict(h) for h in self.history],
+        }
+
+
+@dataclass
 class ProxyNode:
     """代理节点：proxy_pool 管理，anti_block/crawl_cost 消费。"""
     node_id: str

@@ -1,6 +1,13 @@
 import { request } from './client'
 import { moduleMeta } from '@/data/modules'
-import type { ActionResult, EntryRow, OverviewResult, PageResult } from '@/data/types'
+import type {
+  ActionResult,
+  EntryRow,
+  OverviewResult,
+  PageResult,
+  ReceiptDetail,
+  ReceiptListResult,
+} from '@/data/types'
 
 export { moduleMeta }
 
@@ -57,5 +64,49 @@ export async function downloadEntries(
 export async function loadOverview(): Promise<OverviewResult> {
   const response = await request('/api/overview')
   if (!response.ok) throw new Error('运营概览读取失败')
+  return await response.json()
+}
+
+// ---------------------------------------------------------------------------
+// 抽样检验回执与投递放行
+// ---------------------------------------------------------------------------
+
+export async function listReceipts(batchId = ''): Promise<ReceiptListResult> {
+  const query = batchId ? `?batch_id=${encodeURIComponent(batchId)}` : ''
+  const response = await request(`/api/quality_sample/receipts${query}`)
+  if (!response.ok) throw new Error('抽样检验回执读取失败')
+  return await response.json()
+}
+
+export async function getReceiptDetail(receiptId: string): Promise<ReceiptDetail> {
+  const response = await request(`/api/quality_sample/receipts/${encodeURIComponent(receiptId)}`)
+  if (!response.ok) throw new Error('回执明细读取失败')
+  return await response.json()
+}
+
+export async function startInspection(batchId: string, sampleSize?: number): Promise<ActionResult> {
+  const response = await request('/api/quality_sample/inspect', {
+    method: 'POST',
+    body: JSON.stringify({ batch_id: batchId, sample_size: sampleSize ?? null }),
+  })
+  return await response.json()
+}
+
+export async function receiptAction(
+  receiptId: string,
+  action: 'confirm' | 'interrupt' | 'retry',
+): Promise<ActionResult> {
+  const response = await request(
+    `/api/quality_sample/receipts/${encodeURIComponent(receiptId)}/${action}`,
+    { method: 'POST' },
+  )
+  return await response.json()
+}
+
+export async function submitDelivery(batchId: string): Promise<ActionResult> {
+  const response = await request('/api/data_delivery/submit', {
+    method: 'POST',
+    body: JSON.stringify({ batch_id: batchId }),
+  })
   return await response.json()
 }

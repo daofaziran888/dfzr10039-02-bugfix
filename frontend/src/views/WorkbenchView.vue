@@ -70,6 +70,9 @@
       </tbody>
     </table>
 
+    <QualityReceiptsPanel v-if="meta.key === 'quality_sample'" @changed="reload" />
+    <DeliverySubmitPanel v-if="meta.key === 'data_delivery'" :rows="rows" @changed="reload" />
+
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记{{ meta.entity }}</h3>
@@ -104,6 +107,8 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import DeliverySubmitPanel from '@/views/DeliverySubmitPanel.vue'
+import QualityReceiptsPanel from '@/views/QualityReceiptsPanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)

@@ -81,5 +81,17 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 抽样检验回执与投递放行
+
+质量抽样算出有效条数后会生成**抽样检验回执**并落库，回执按
+`(抽样计划, 批次, 批次版本, 检验次数)` 锁定：
+
+- `POST /api/quality_sample/inspect` 发起检验生成待核回执；同次检验并发提交合并为一份，已有已确认回执则沿用结论。
+- `POST /api/quality_sample/receipts/{id}/confirm|interrupt|retry` 确认（并发确认只生效一次）、中断、中断后重试（新次数回执，各自留痕）。
+- `GET /api/quality_sample/receipts`、`GET /api/quality_sample/receipts/{id}` 质检视图复核列表与明细（样本、对应批次校验结果、首次中断及后续完成历程）。
+- `POST /api/data_delivery/submit` 投递核对：凭当前批次版本的已确认回执决定放行或待核，取数依据写回投递台账。
+
+前端在「质量抽样」工作台内嵌回执复核面板，在「数据投递」工作台内嵌投递核对与取数依据面板。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA
